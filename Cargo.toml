@@ -1,0 +1,15 @@
+[package]
+name = "mania-rating-analyze"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+mania-converter = { git = "https://github.com/Siflorite/mania-converter-rust.git", rev = "d7d090beb5d301c16dff5d540ff61151b9710855" }
+osu-db = { git = "https://github.com/Siflorite/osu-db.git", rev = "96c2b6c644d3e74b31ff5577e05fb3d2ea3c05a6" }
+rayon = "1.10"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
