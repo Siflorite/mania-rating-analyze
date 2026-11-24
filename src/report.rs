@@ -8,10 +8,8 @@ use std::{
 };
 
 const BEST_HEADER: &str = "hash,artist,title,creator,version,player,time,mods,notes,lns,max,300,200,100,50,miss,acc,rating_acc,level,rating,delta";
-const STATS_HEADER: &str =
-    "scope,player,level_floor,count,mean_delta,p95_delta,top5_mean_delta,best_delta";
 
-/// Write every hash's best play and summarize all plays, including repeats.
+/// Export unfiltered and filtered map bests, and summarize the latter.
 /// Rows for equal best ratings use the last occurrence in the input slice.
 pub fn export(plays: &[Play], out: &Path) -> Result<()> {
     for (i, p) in plays.iter().enumerate() {
@@ -36,7 +34,8 @@ pub fn export(plays: &[Play], out: &Path) -> Result<()> {
         };
         let best = out.join(format!("best_{suffix}.csv"));
         let stats = out.join(format!("stats_{suffix}.csv"));
-        if stats.try_exists()? {
+        let best_stats = out.join(format!("best_stats_{suffix}.csv"));
+        if stats.try_exists()? || best_stats.try_exists()? {
             continue;
         }
         let file = match File::create_new(&best) {
@@ -44,11 +43,21 @@ pub fn export(plays: &[Play], out: &Path) -> Result<()> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e).with_context(|| format!("create {}", best.display())),
         };
-        write_file(file, &best, |w| write_best(w, plays))?;
+        let rows = filtered_best(plays);
+        write_file(file, &best, |w| write_best(w, &rows))?;
         let file =
             File::create_new(&stats).with_context(|| format!("create {}", stats.display()))?;
-        write_file(file, &stats, |w| write_stats(w, plays))?;
-        println!("{}\n{}", best.display(), stats.display());
+        write_file(file, &stats, |w| write_best(w, &map_bests(plays)))?;
+        let file = File::create_new(&best_stats)
+            .with_context(|| format!("create {}", best_stats.display()))?;
+        write_file(file, &best_stats, |w| write_best_stats(w, &rows))?;
+        println!(
+            "{}\n{}\n{}\n筛选后谱面数：{}",
+            stats.display(),
+            best.display(),
+            best_stats.display(),
+            rows.len()
+        );
         return Ok(());
     }
     anyhow::bail!("没有可用的输出文件名")
@@ -75,8 +84,14 @@ fn text(w: &mut impl Write, s: &str) -> io::Result<()> {
     }
 }
 
-fn write_best(w: &mut impl Write, plays: &[Play]) -> io::Result<()> {
-    write!(w, "{BEST_HEADER}\r\n")?;
+fn filtered_best(plays: &[Play]) -> Vec<&Play> {
+    map_bests(plays.iter().filter(|p| {
+        let total = u64::from(p.notes) + u64::from(p.lns);
+        p.rating_acc >= 96.0 && total > 0 && 4 * u64::from(p.lns) <= total
+    }))
+}
+
+fn map_bests<'a>(plays: impl IntoIterator<Item = &'a Play>) -> Vec<&'a Play> {
     let mut best = BTreeMap::new();
     for p in plays {
         let current = best.entry(p.hash.as_str()).or_insert(p);
@@ -87,6 +102,11 @@ fn write_best(w: &mut impl Write, plays: &[Play]) -> io::Result<()> {
     // The stable sort preserves hash order when ratings compare equal.
     let mut rows: Vec<_> = best.into_values().collect();
     rows.sort_by(|a, b| b.rating.partial_cmp(&a.rating).expect("finite ratings"));
+    rows
+}
+
+fn write_best(w: &mut impl Write, rows: &[&Play]) -> io::Result<()> {
+    write!(w, "{BEST_HEADER}\r\n")?;
     for p in rows {
         for s in [
             &p.hash, &p.artist, &p.title, &p.creator, &p.version, &p.player, &p.time,
@@ -100,7 +120,7 @@ fn write_best(w: &mut impl Write, plays: &[Play]) -> io::Result<()> {
         }
         write!(
             w,
-            ",{},{},{},{},{:+}\r\n",
+            ",{:.8},{:.8},{:.8},{:.8},{:.8}\r\n",
             p.acc,
             p.rating_acc,
             p.level,
@@ -120,29 +140,22 @@ fn summary(v: &mut [f64]) -> [f64; 4] {
     [mean(v), v[n - 1 - n / 20], mean(top), v[n - 1]]
 }
 
-fn write_stats(w: &mut impl Write, plays: &[Play]) -> io::Result<()> {
-    write!(w, "{STATS_HEADER}\r\n")?;
+fn write_best_stats(w: &mut impl Write, rows: &[&Play]) -> io::Result<()> {
+    w.write_all(b"level_floor,count,mean_delta,p95_delta,top5_mean_delta,best_delta\r\n")?;
     let mut groups = BTreeMap::<_, Vec<f64>>::new();
-    for p in plays {
-        let floor = p.level.floor() as i64;
-        let delta = p.rating - p.level;
-        for player in [None, Some(p.player.as_str())] {
-            groups.entry((player, floor)).or_default().push(delta);
-        }
+    for p in rows {
+        groups
+            .entry(p.level.floor() as i64)
+            .or_default()
+            .push(p.rating - p.level);
     }
-    for ((player, floor), mut values) in groups {
-        match player {
-            None => w.write_all(b"all_players,")?,
-            Some(name) => {
-                w.write_all(b"player,")?;
-                text(w, name)?;
-            }
-        }
-        write!(w, ",{floor},{}", values.len())?;
-        for value in summary(&mut values) {
-            write!(w, ",{value}")?;
-        }
-        w.write_all(b"\r\n")?;
+    for (level, mut values) in groups {
+        let count = values.len();
+        let [mean, p95, top5, best] = summary(&mut values);
+        write!(
+            w,
+            "{level},{count},{mean:.8},{p95:.8},{top5:.8},{best:.8}\r\n"
+        )?;
     }
     Ok(())
 }
@@ -183,11 +196,20 @@ mod tests {
             play("c", "first", 9.0, 1.0),
         ];
         let mut buf = Vec::new();
-        write_best(&mut buf, &plays).unwrap();
+        let mut plays = plays;
+        for p in &mut plays {
+            p.rating_acc = 96.0;
+        }
+        write_best(&mut buf, &filtered_best(&plays)).unwrap();
         let csv = String::from_utf8(buf).unwrap();
         let rows = csv.strip_prefix(&format!("{BEST_HEADER}\r\n")).unwrap();
         assert!(rows.starts_with("c,"));
-        assert!(rows.lines().next().unwrap().ends_with(",1,9,+8"));
+        assert!(
+            rows.lines()
+                .next()
+                .unwrap()
+                .ends_with(",1.00000000,9.00000000,8.00000000")
+        );
         assert!(
             rows.find("\r\na,,\"曲,\"\"名\"\"\r\n\",,,last,").unwrap()
                 < rows.find("\r\nz,").unwrap()
@@ -196,26 +218,71 @@ mod tests {
     }
 
     #[test]
-    fn stats_use_every_play_and_floor_level() {
+    fn unfiltered_stats_keep_low_acc_and_ln_heavy_winners() {
         let plays = [
-            play("a", "x", 2.0, -0.5),
-            play("a", "x", 4.0, -1.0),
-            play("a", "x", 8.0, 0.0),
-            play("a", "y", 5.0, -1.0),
+            play("a", "one", 5.0, 7.0),
+            Play {
+                notes: 0,
+                lns: 9,
+                ..play("a", "two", 6.0, 7.0)
+            },
+            play("b", "one", 4.0, 7.0),
         ];
-        let mut buf = Vec::new();
-        write_stats(&mut buf, &plays).unwrap();
-        let csv = String::from_utf8(buf).unwrap();
-        let rows: Vec<_> = csv.lines().skip(1).collect();
+        let rows = map_bests(&plays);
         assert_eq!(
-            rows,
-            [
-                "all_players,,-1,3,4.5,6,6,6",
-                "all_players,,0,1,8,8,8,8",
-                "player,x,-1,2,3.75,5,5,5",
-                "player,x,0,1,8,8,8,8",
-                "player,y,-1,1,6,6,6,6",
-            ]
+            rows.iter()
+                .map(|p| (p.hash.as_str(), p.player.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "two"), ("b", "one")]
+        );
+        assert!(filtered_best(&plays).is_empty());
+    }
+
+    #[test]
+    fn filters_before_selecting_best_and_binning() {
+        let base = Play {
+            notes: 3,
+            lns: 1,
+            rating_acc: 96.0,
+            ..play("a", "first", 11.0, 10.5)
+        };
+        let plays = [
+            Play {
+                rating: 20.0,
+                rating_acc: 95.999,
+                ..base.clone()
+            },
+            base.clone(),
+            Play {
+                hash: "b".into(),
+                lns: 2,
+                ..base.clone()
+            },
+            Play {
+                hash: "c".into(),
+                notes: 0,
+                lns: 0,
+                ..base.clone()
+            },
+            Play {
+                player: "other".into(),
+                rating: 14.0,
+                level: 11.0,
+                ..base
+            },
+        ];
+        let rows = filtered_best(&plays);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].player, "other");
+        let mut buf = Vec::new();
+        write_best_stats(&mut buf, &rows).unwrap();
+        assert_eq!(
+            String::from_utf8(buf)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>(),
+            ["11,1,3.00000000,3.00000000,3.00000000,3.00000000"]
         );
     }
 
@@ -229,8 +296,11 @@ mod tests {
     fn empty_reports_still_have_headers() {
         let (mut best, mut stats) = (Vec::new(), Vec::new());
         write_best(&mut best, &[]).unwrap();
-        write_stats(&mut stats, &[]).unwrap();
+        write_best_stats(&mut stats, &[]).unwrap();
         assert_eq!(best, format!("{BEST_HEADER}\r\n").as_bytes());
-        assert_eq!(stats, format!("{STATS_HEADER}\r\n").as_bytes());
+        assert_eq!(
+            stats,
+            b"level_floor,count,mean_delta,p95_delta,top5_mean_delta,best_delta\r\n"
+        );
     }
 }
