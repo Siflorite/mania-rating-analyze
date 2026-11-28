@@ -141,7 +141,17 @@ fn summary(v: &mut [f64]) -> [f64; 4] {
 }
 
 fn write_best_stats(w: &mut impl Write, rows: &[&Play]) -> io::Result<()> {
-    w.write_all(b"level_floor,count,mean_delta,p95_delta,top5_mean_delta,best_delta\r\n")?;
+    const BINS: usize = 10;
+    w.write_all(b"level_floor,count,mean_delta,p95_delta,top5_mean_delta,best_delta")?;
+    for i in 0..BINS {
+        write!(
+            w,
+            ",\"delta_count_[{:.1},{:.1})\"",
+            i as f64 / 2.0,
+            (i + 1) as f64 / 2.0
+        )?;
+    }
+    w.write_all(b"\r\n")?;
     let mut groups = BTreeMap::<_, Vec<f64>>::new();
     for p in rows {
         groups
@@ -152,10 +162,18 @@ fn write_best_stats(w: &mut impl Write, rows: &[&Play]) -> io::Result<()> {
     for (level, mut values) in groups {
         let count = values.len();
         let [mean, p95, top5, best] = summary(&mut values);
-        write!(
-            w,
-            "{level},{count},{mean:.8},{p95:.8},{top5:.8},{best:.8}\r\n"
-        )?;
+        write!(w, "{level},{count},{mean:.8},{p95:.8},{top5:.8},{best:.8}")?;
+        let mut bins = [0usize; BINS];
+        for delta in values {
+            let index = delta * 2.0;
+            if (0.0..BINS as f64).contains(&index) {
+                bins[index as usize] += 1;
+            }
+        }
+        for n in bins {
+            write!(w, ",{n}")?;
+        }
+        w.write_all(b"\r\n")?;
     }
     Ok(())
 }
@@ -282,7 +300,7 @@ mod tests {
                 .lines()
                 .skip(1)
                 .collect::<Vec<_>>(),
-            ["11,1,3.00000000,3.00000000,3.00000000,3.00000000"]
+            ["11,1,3.00000000,3.00000000,3.00000000,3.00000000,0,0,0,0,0,0,1,0,0,0"]
         );
     }
 
@@ -298,9 +316,9 @@ mod tests {
         write_best(&mut best, &[]).unwrap();
         write_best_stats(&mut stats, &[]).unwrap();
         assert_eq!(best, format!("{BEST_HEADER}\r\n").as_bytes());
-        assert_eq!(
-            stats,
-            b"level_floor,count,mean_delta,p95_delta,top5_mean_delta,best_delta\r\n"
-        );
+        let header = String::from_utf8(stats).unwrap();
+        assert_eq!(header.lines().count(), 1);
+        assert_eq!(header.matches("delta_count_").count(), 10);
+        assert!(header.ends_with("\"delta_count_[4.5,5.0)\"\r\n"));
     }
 }
